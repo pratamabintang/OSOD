@@ -368,7 +368,10 @@ if __name__ == '__main__':
         # save test image
         if vis and i%1==0:
           im2show = cv2.imread(dataset_vu._roidb[dataset_vu.ratio_index[i]]['image'])
-          im2show = vis_detections(im2show, 'shot', cls_dets.cpu().numpy(), 0.8)
+          dets_vis = all_boxes[catgory][index]
+          if len(dets_vis) == 0:
+            dets_vis = np.zeros((0, 5), dtype=np.float32)
+          im2show = vis_detections(im2show, 'shot', dets_vis, 0.8)
 
           o_support = data[1][0].permute(1, 2,0).contiguous().cpu().numpy()
           o_support *= [0.229, 0.224, 0.225]
