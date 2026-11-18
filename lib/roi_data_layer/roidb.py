@@ -160,22 +160,22 @@ def combined_roidb(imdb_names, training=True, seen=1):
 
   imdbs = []
   roidbs = []
-  querys = []
+  supports = []
   for s in imdb_names.split('+'):
-    imdb, roidb, query, reserved = get_roidb(s, training)
+    imdb, roidb, support, reserved = get_roidb(s, training)
     imdbs.append(imdb)
     roidbs.append(roidb)
-    querys.append(query)
+    supports.append(support)
   imdb = imdbs[0]
   roidb = roidbs[0]
-  query = querys[0]
+  support = supports[0]
 
 
   if len(roidbs) > 1 and training:
     for r in roidbs[1:]:
       roidb.extend(r)
-    for r in range(len(querys[0])):
-      query[r].extend(querys[1][r])
+    for r in range(len(supports[0])):
+      support[r].extend(supports[1][r])
     tmp = get_imdb(imdb_names.split('+')[1])
     imdb = datasets.imdb.imdb(imdb_names, tmp.classes)
 
@@ -186,4 +186,4 @@ def combined_roidb(imdb_names, training=True, seen=1):
     # Generate testing image, an image testing frequency(time) according to the reserved category
     ratio_list, ratio_index = test_rank_roidb_ratio(roidb, reserved)
 
-  return imdb, roidb, ratio_list, ratio_index, query
+  return imdb, roidb, ratio_list, ratio_index, support

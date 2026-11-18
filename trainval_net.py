@@ -2,9 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import _init_paths
 import os
-import sys
 import numpy as np
 import argparse
 import pprint
@@ -14,7 +12,6 @@ import time
 import torch
 from torch.autograd import Variable
 import torch.nn as nn
-import torch.optim as optim
 
 import torchvision.transforms as transforms
 from torch.utils.data.sampler import Sampler
@@ -189,11 +186,11 @@ if __name__ == '__main__':
   cfg.USE_GPU_NMS = args.cuda
   
   # create dataloader
-  imdb, roidb, ratio_list, ratio_index, query = combined_roidb(args.imdb_name, True, seen=args.seen)
+  imdb, roidb, ratio_list, ratio_index, support = combined_roidb(args.imdb_name, True, seen=args.seen)
   train_size = len(roidb)
   print('{:d} roidb entries'.format(len(roidb)))
   sampler_batch = sampler(train_size, args.batch_size)
-  dataset = roibatchLoader(roidb, ratio_list, ratio_index, query, args.batch_size, imdb.num_classes, training=True)
+  dataset = roibatchLoader(roidb, ratio_list, ratio_index, support, args.batch_size, imdb.num_classes, training=True)
   dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size,
                             sampler=sampler_batch, num_workers=args.num_workers)
 
@@ -204,7 +201,7 @@ if __name__ == '__main__':
 
   # initilize the tensor holder here.
   im_data = torch.FloatTensor(1)
-  query   = torch.FloatTensor(1)
+  support   = torch.FloatTensor(1)
   im_info = torch.FloatTensor(1)
   num_boxes = torch.LongTensor(1)
   gt_boxes = torch.FloatTensor(1)
@@ -212,7 +209,7 @@ if __name__ == '__main__':
   # ship to cuda
   if args.cuda:
     im_data = im_data.cuda()
-    query   = query.cuda()
+    support   = support.cuda()
     im_info = im_info.cuda()
     num_boxes = num_boxes.cuda()
     gt_boxes = gt_boxes.cuda()
@@ -220,7 +217,7 @@ if __name__ == '__main__':
 
   # make variable
   im_data = Variable(im_data)
-  query   = Variable(query)
+  support   = Variable(support)
   im_info = Variable(im_info)
   num_boxes = Variable(num_boxes)
   gt_boxes = Variable(gt_boxes)
@@ -298,7 +295,7 @@ if __name__ == '__main__':
     for step in range(iters_per_epoch):
       data = next(data_iter)
       im_data.resize_(data[0].size()).copy_(data[0])
-      query.resize_(data[1].size()).copy_(data[1])
+      support.resize_(data[1].size()).copy_(data[1])
       im_info.resize_(data[2].size()).copy_(data[2])
       gt_boxes.resize_(data[3].size()).copy_(data[3])
       num_boxes.resize_(data[4].size()).copy_(data[4])
@@ -307,7 +304,7 @@ if __name__ == '__main__':
       rois, cls_prob, bbox_pred, \
       rpn_loss_cls, rpn_loss_box, \
       RCNN_loss_cls, margin_loss, RCNN_loss_bbox, \
-      rois_label, _ = fasterRCNN(im_data, query, im_info, gt_boxes, num_boxes)
+      rois_label, _ = fasterRCNN(im_data, support, im_info, gt_boxes, num_boxes)
 
       loss = rpn_loss_cls.mean() + rpn_loss_box.mean() \
            + RCNN_loss_cls.mean() + margin_loss.mean() + RCNN_loss_bbox.mean()

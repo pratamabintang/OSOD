@@ -172,9 +172,9 @@ if __name__ == '__main__':
 
   # Load dataset
   cfg.TRAIN.USE_FLIPPED = False
-  imdb_vu, roidb_vu, ratio_list_vu, ratio_index_vu, query_vu = combined_roidb(args.imdbval_name, False, seen=args.seen)
+  imdb_vu, roidb_vu, ratio_list_vu, ratio_index_vu, support_vu = combined_roidb(args.imdbval_name, False, seen=args.seen)
   imdb_vu.competition_mode(on=True)
-  dataset_vu = roibatchLoader(roidb_vu, ratio_list_vu, ratio_index_vu, query_vu, 1, imdb_vu.num_classes, training=False, seen=args.seen)
+  dataset_vu = roibatchLoader(roidb_vu, ratio_list_vu, ratio_index_vu, support_vu, 1, imdb_vu.num_classes, training=False, seen=args.seen)
 
 
   
@@ -208,7 +208,7 @@ if __name__ == '__main__':
   # initilize the tensor holder here.
   print('load model successfully!')
   im_data = torch.FloatTensor(1)
-  query   = torch.FloatTensor(1)
+  support   = torch.FloatTensor(1)
   im_info = torch.FloatTensor(1)
   catgory = torch.LongTensor(1)
   gt_boxes = torch.FloatTensor(1)
@@ -218,14 +218,14 @@ if __name__ == '__main__':
     cfg.CUDA = True
     fasterRCNN.cuda()
     im_data = im_data.cuda()
-    query = query.cuda()
+    support = support.cuda()
     im_info = im_info.cuda()
     catgory = catgory.cuda()
     gt_boxes = gt_boxes.cuda()
 
   # make variable
   im_data = Variable(im_data)
-  query = Variable(query)
+  support = Variable(support)
   im_info = Variable(im_info)
   catgory = Variable(catgory)
   gt_boxes = Variable(gt_boxes)
@@ -246,7 +246,7 @@ if __name__ == '__main__':
 
   fasterRCNN.eval()
   for avg in range(args.average):
-    dataset_vu.query_position = avg
+    dataset_vu.support_position = avg
     dataloader_vu = torch.utils.data.DataLoader(dataset_vu, batch_size=1,shuffle=False, num_workers=0,pin_memory=True)
 
     data_iter_vu = iter(dataloader_vu)
@@ -273,7 +273,7 @@ if __name__ == '__main__':
       for i,index in enumerate(ratio_index_vu[0]):
         data = next(data_iter_vu)
         im_data.data.resize_(data[0].size()).copy_(data[0])
-        query.data.resize_(data[1].size()).copy_(data[1])
+        support.data.resize_(data[1].size()).copy_(data[1])
         im_info.data.resize_(data[2].size()).copy_(data[2])
         gt_boxes.data.resize_(data[3].size()).copy_(data[3])
         catgory.data.resize_(data[4].size()).copy_(data[4])
@@ -284,7 +284,7 @@ if __name__ == '__main__':
         rois, cls_prob, bbox_pred, \
         rpn_loss_cls, rpn_loss_box, \
         RCNN_loss_cls, _, RCNN_loss_bbox, \
-        rois_label, weight = fasterRCNN(im_data, query, im_info, gt_boxes, catgory)
+        rois_label, weight = fasterRCNN(im_data, support, im_info, gt_boxes, catgory)
 
 
         scores = cls_prob.data
@@ -366,15 +366,15 @@ if __name__ == '__main__':
           im2show = cv2.imread(dataset_vu._roidb[dataset_vu.ratio_index[i]]['image'])
           im2show = vis_detections(im2show, 'shot', cls_dets.cpu().numpy(), 0.8)
 
-          o_query = data[1][0].permute(1, 2,0).contiguous().cpu().numpy()
-          o_query *= [0.229, 0.224, 0.225]
-          o_query += [0.485, 0.456, 0.406]
-          o_query *= 255
-          o_query = o_query[:,:,::-1]
+          o_support = data[1][0].permute(1, 2,0).contiguous().cpu().numpy()
+          o_support *= [0.229, 0.224, 0.225]
+          o_support += [0.485, 0.456, 0.406]
+          o_support *= 255
+          o_support = o_support[:,:,::-1]
 
           (h,w,c) = im2show.shape
-          o_query = cv2.resize(o_query, (h, h),interpolation=cv2.INTER_LINEAR)
-          im2show = np.concatenate((im2show, o_query), axis=1)
+          o_support = cv2.resize(o_support, (h, h),interpolation=cv2.INTER_LINEAR)
+          im2show = np.concatenate((im2show, o_support), axis=1)
 
           cv2.imwrite('./test_img/%d_d.png'%(i), im2show)
       

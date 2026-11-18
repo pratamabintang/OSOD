@@ -24,9 +24,9 @@ import time
 import pdb
 
 class roibatchLoader(data.Dataset):
-  def __init__(self, roidb, ratio_list, ratio_index, query, batch_size, num_classes, training=True, normalize=None, seen=True):
+  def __init__(self, roidb, ratio_list, ratio_index, support, batch_size, num_classes, training=True, normalize=None, seen=True):
     self._roidb = roidb
-    self._query = query
+    self._support = support
     self._num_classes = num_classes
     # we make the height of image consistent to trim_height, trim_width
     self.trim_height = cfg.TRAIN.TRIM_HEIGHT
@@ -35,7 +35,7 @@ class roibatchLoader(data.Dataset):
     self.training = training
     self.normalize = normalize
     self.ratio_list = ratio_list
-    self.query_position = 0
+    self.support_position = 0
 
     if training:
         self.ratio_index = ratio_index
@@ -87,207 +87,154 @@ class roibatchLoader(data.Dataset):
     self.probability()
 
 
+  def _choose_train_category(self, blobs):
+    # Pick support class weighted by how often each class was seen.
+    catgory = blobs['gt_boxes'][:,-1]
+    cand = np.unique(catgory)
+    if len(cand)==1:
+      choice = cand[0]
+    else:
+      p = []
+      for i in cand:
+        p.append(self.show_time[i])
+      p = np.array(p)
+      p /= p.sum()
+      choice = np.random.choice(cand,1,p=p)[0]
+    # Mark chosen class as 1, everything else 0.
+    blobs['gt_boxes'][:,-1] = np.where(blobs['gt_boxes'][:,-1]==choice,1,0)
+    return choice
+
+  @staticmethod
+  def _sample_crop_start(min_v, max_v, trim_size, size):
+    # Same start-sampling for height and width crops (was duplicated).
+    box_region = max_v - min_v + 1
+    if min_v == 0:
+      return 0
+    if (box_region-trim_size) < 0:
+      s_min = max(max_v-trim_size, 0)
+      s_max = min(min_v, size-trim_size)
+      if s_min == s_max:
+        return s_min
+      return np.random.choice(range(s_min, s_max))
+    else:
+      s_add = int((box_region-trim_size)/2)
+      if s_add == 0:
+        return min_v
+      return np.random.choice(range(min_v, min_v+s_add))
+
+  def _crop_to_ratio(self, data, gt_boxes, ratio, data_height, data_width):
+    # Crop longer side so the image matches the batch ratio.
+    if ratio < 1:
+      min_y = int(torch.min(gt_boxes[:,1]))
+      max_y = int(torch.max(gt_boxes[:,3]))
+      trim_size = int(np.floor(data_width / ratio))
+      if trim_size > data_height:
+        trim_size = data_height
+      y_s = self._sample_crop_start(min_y, max_y, trim_size, data_height)
+      data = data[:, y_s:(y_s + trim_size), :, :]
+      gt_boxes[:, 1] = gt_boxes[:, 1] - float(y_s)
+      gt_boxes[:, 3] = gt_boxes[:, 3] - float(y_s)
+      gt_boxes[:, 1].clamp_(0, trim_size - 1)
+      gt_boxes[:, 3].clamp_(0, trim_size - 1)
+    else:
+      min_x = int(torch.min(gt_boxes[:,0]))
+      max_x = int(torch.max(gt_boxes[:,2]))
+      trim_size = int(np.ceil(data_height * ratio))
+      if trim_size > data_width:
+        trim_size = data_width
+      x_s = self._sample_crop_start(min_x, max_x, trim_size, data_width)
+      data = data[:, :, x_s:(x_s + trim_size), :]
+      gt_boxes[:, 0] = gt_boxes[:, 0] - float(x_s)
+      gt_boxes[:, 2] = gt_boxes[:, 2] - float(x_s)
+      gt_boxes[:, 0].clamp_(0, trim_size - 1)
+      gt_boxes[:, 2].clamp_(0, trim_size - 1)
+    return data, gt_boxes
+
+  def _pad_to_ratio(self, data, gt_boxes, im_info, ratio, data_height, data_width):
+    # Pad shorter side so the image matches the batch ratio.
+    if ratio < 1:
+      padding_data = torch.FloatTensor(int(np.ceil(data_width / ratio)), \
+                                       data_width, 3).zero_()
+      padding_data[:data_height, :, :] = data[0]
+      im_info[0, 0] = padding_data.size(0)
+    elif ratio > 1:
+      padding_data = torch.FloatTensor(data_height, \
+                                       int(np.ceil(data_height * ratio)), 3).zero_()
+      padding_data[:, :data_width, :] = data[0]
+      im_info[0, 1] = padding_data.size(1)
+    else:
+      trim_size = min(data_height, data_width)
+      padding_data = torch.FloatTensor(trim_size, trim_size, 3).zero_()
+      padding_data = data[0][:trim_size, :trim_size, :]
+      gt_boxes[:, :4].clamp_(0, trim_size)
+      im_info[0, 0] = trim_size
+      im_info[0, 1] = trim_size
+    return padding_data, gt_boxes, im_info
+
+  def _filter_and_pad_boxes(self, gt_boxes):
+    # Drop degenerate boxes, then pad to a fixed count.
+    not_keep = (gt_boxes[:,0] == gt_boxes[:,2]) | (gt_boxes[:,1] == gt_boxes[:,3])
+    keep = torch.nonzero(not_keep == 0).view(-1)
+    gt_boxes_padding = torch.FloatTensor(self.max_num_box, gt_boxes.size(1)).zero_()
+    if keep.numel() != 0 :
+      gt_boxes = gt_boxes[keep]
+      num_boxes = min(gt_boxes.size(0), self.max_num_box)
+      gt_boxes_padding[:num_boxes,:] = gt_boxes[:num_boxes]
+    else:
+      num_boxes = 0
+    return gt_boxes_padding, num_boxes
+
   def __getitem__(self, index):
     index_ratio = int(self.ratio_index[index])
-
-    # get the anchor index for current sample index
-    # here we set the anchor index to the last one
-    # sample in this group
     minibatch_db = [self._roidb[index_ratio]]
-
     blobs = get_minibatch(minibatch_db , self._num_classes)
-
     blobs['gt_boxes'] = [x for x in blobs['gt_boxes'] if x[-1] in self.list_ind]
     blobs['gt_boxes'] = np.array(blobs['gt_boxes'])
 
-
     if self.training:
-        # Random choice query catgory
-        catgory = blobs['gt_boxes'][:,-1]
-        cand = np.unique(catgory)
-        if len(cand)==1:
-            choice = cand[0]
-        else:
-            p = []
-            for i in cand:
-                p.append(self.show_time[i])
-            p = np.array(p)
-            p /= p.sum()
-            choice  = np.random.choice(cand,1,p=p)[0]
-
-        # Delete useless gt_boxes
-        blobs['gt_boxes'][:,-1] = np.where(blobs['gt_boxes'][:,-1]==choice,1,0)
-        # Get query image
-        query = self.load_query(choice)
+      choice = self._choose_train_category(blobs)
+      support = self.load_support(choice)
     else:
-        query = self.load_query(index, minibatch_db[0]['img_id'])
+      support = self.load_support(index, minibatch_db[0]['img_id'])
 
     data = torch.from_numpy(blobs['data'])
-    query = torch.from_numpy(query)
-    query = query.permute(0, 3, 1, 2).contiguous().squeeze(0)
+    support = torch.from_numpy(support)
+    support = support.permute(0, 3, 1, 2).contiguous().squeeze(0)
     im_info = torch.from_numpy(blobs['im_info'])
-    
-    # we need to random shuffle the bounding box.
     data_height, data_width = data.size(1), data.size(2)
+
     if self.training:
-        np.random.shuffle(blobs['gt_boxes'])
-        gt_boxes = torch.from_numpy(blobs['gt_boxes'])
-
-        ########################################################
-        # padding the input image to fixed size for each group #
-        ########################################################
-
-        # NOTE1: need to cope with the case where a group cover both conditions. (done)
-        # NOTE2: need to consider the situation for the tail samples. (no worry)
-        # NOTE3: need to implement a parallel data loader. (no worry)
-        # get the index range
-
-        # if the image need to crop, crop to the target size.
-        ratio = self.ratio_list_batch[index]
-
-        if self._roidb[index_ratio]['need_crop']:
-            if ratio < 1:
-                # this means that data_width << data_height, we need to crop the
-                # data_height
-                min_y = int(torch.min(gt_boxes[:,1]))
-                max_y = int(torch.max(gt_boxes[:,3]))
-                trim_size = int(np.floor(data_width / ratio))
-                if trim_size > data_height:
-                    trim_size = data_height                
-                box_region = max_y - min_y + 1
-                if min_y == 0:
-                    y_s = 0
-                else:
-                    if (box_region-trim_size) < 0:
-                        y_s_min = max(max_y-trim_size, 0)
-                        y_s_max = min(min_y, data_height-trim_size)
-                        if y_s_min == y_s_max:
-                            y_s = y_s_min
-                        else:
-                            y_s = np.random.choice(range(y_s_min, y_s_max))
-                    else:
-                        y_s_add = int((box_region-trim_size)/2)
-                        if y_s_add == 0:
-                            y_s = min_y
-                        else:
-                            y_s = np.random.choice(range(min_y, min_y+y_s_add))
-                # crop the image
-                data = data[:, y_s:(y_s + trim_size), :, :]
-
-                # shift y coordiante of gt_boxes
-                gt_boxes[:, 1] = gt_boxes[:, 1] - float(y_s)
-                gt_boxes[:, 3] = gt_boxes[:, 3] - float(y_s)
-
-                # update gt bounding box according the trip
-                gt_boxes[:, 1].clamp_(0, trim_size - 1)
-                gt_boxes[:, 3].clamp_(0, trim_size - 1)
-
-            else:
-                # this means that data_width >> data_height, we need to crop the
-                # data_width
-                min_x = int(torch.min(gt_boxes[:,0]))
-                max_x = int(torch.max(gt_boxes[:,2]))
-                trim_size = int(np.ceil(data_height * ratio))
-                if trim_size > data_width:
-                    trim_size = data_width                
-                box_region = max_x - min_x + 1
-                if min_x == 0:
-                    x_s = 0
-                else:
-                    if (box_region-trim_size) < 0:
-                        x_s_min = max(max_x-trim_size, 0)
-                        x_s_max = min(min_x, data_width-trim_size)
-                        if x_s_min == x_s_max:
-                            x_s = x_s_min
-                        else:
-                            x_s = np.random.choice(range(x_s_min, x_s_max))
-                    else:
-                        x_s_add = int((box_region-trim_size)/2)
-                        if x_s_add == 0:
-                            x_s = min_x
-                        else:
-                            x_s = np.random.choice(range(min_x, min_x+x_s_add))
-                # crop the image
-                data = data[:, :, x_s:(x_s + trim_size), :]
-
-                # shift x coordiante of gt_boxes
-                gt_boxes[:, 0] = gt_boxes[:, 0] - float(x_s)
-                gt_boxes[:, 2] = gt_boxes[:, 2] - float(x_s)
-                # update gt bounding box according the trip
-                gt_boxes[:, 0].clamp_(0, trim_size - 1)
-                gt_boxes[:, 2].clamp_(0, trim_size - 1)
-
-        # based on the ratio, padding the image.
-        if ratio < 1:
-            # this means that data_width < data_height
-            trim_size = int(np.floor(data_width / ratio))
-
-            padding_data = torch.FloatTensor(int(np.ceil(data_width / ratio)), \
-                                             data_width, 3).zero_()
-
-            padding_data[:data_height, :, :] = data[0]
-            # update im_info
-            im_info[0, 0] = padding_data.size(0)
-            # print("height %d %d \n" %(index, anchor_idx))
-        elif ratio > 1:
-            # this means that data_width > data_height
-            # if the image need to crop.
-            padding_data = torch.FloatTensor(data_height, \
-                                             int(np.ceil(data_height * ratio)), 3).zero_()
-            padding_data[:, :data_width, :] = data[0]
-            im_info[0, 1] = padding_data.size(1)
-        else:
-            trim_size = min(data_height, data_width)
-            padding_data = torch.FloatTensor(trim_size, trim_size, 3).zero_()
-            padding_data = data[0][:trim_size, :trim_size, :]
-            # gt_boxes.clamp_(0, trim_size)
-            gt_boxes[:, :4].clamp_(0, trim_size)
-            im_info[0, 0] = trim_size
-            im_info[0, 1] = trim_size
-
-
-        # check the bounding box:
-        not_keep = (gt_boxes[:,0] == gt_boxes[:,2]) | (gt_boxes[:,1] == gt_boxes[:,3])
-        # not_keep = (gt_boxes[:,2] - gt_boxes[:,0]) < 10 
-        # print(not_keep)
-        # not_keep = (gt_boxes[:,2] - gt_boxes[:,0]) < torch.FloatTensor([10]) | (gt_boxes[:,3] - gt_boxes[:,1]) < torch.FloatTensor([10])
-
-        keep = torch.nonzero(not_keep == 0).view(-1)
-
-        gt_boxes_padding = torch.FloatTensor(self.max_num_box, gt_boxes.size(1)).zero_()
-        if keep.numel() != 0 :
-            gt_boxes = gt_boxes[keep]
-            num_boxes = min(gt_boxes.size(0), self.max_num_box)
-            gt_boxes_padding[:num_boxes,:] = gt_boxes[:num_boxes]
-        else:
-            num_boxes = 0
-
-            # permute trim_data to adapt to downstream processing
-        padding_data = padding_data.permute(2, 0, 1).contiguous()
-        im_info = im_info.view(3)
-
-        return padding_data, query, im_info, gt_boxes_padding, num_boxes
+      np.random.shuffle(blobs['gt_boxes'])
+      gt_boxes = torch.from_numpy(blobs['gt_boxes'])
+      ratio = self.ratio_list_batch[index]
+      if self._roidb[index_ratio]['need_crop']:
+        data, gt_boxes = self._crop_to_ratio(data, gt_boxes, ratio,
+                                             data_height, data_width)
+      padding_data, gt_boxes, im_info = self._pad_to_ratio(
+          data, gt_boxes, im_info, ratio, data_height, data_width)
+      gt_boxes_padding, num_boxes = self._filter_and_pad_boxes(gt_boxes)
+      padding_data = padding_data.permute(2, 0, 1).contiguous()
+      im_info = im_info.view(3)
+      return padding_data, support, im_info, gt_boxes_padding, num_boxes
     else:
-        data = data.permute(0, 3, 1, 2).contiguous().view(3, data_height, data_width)
-        im_info = im_info.view(3)
+      data = data.permute(0, 3, 1, 2).contiguous().view(3, data_height, data_width)
+      im_info = im_info.view(3)
+      gt_boxes = torch.from_numpy(blobs['gt_boxes'])
+      choice = self.cat_list[index]
+      return data, support, im_info, gt_boxes, choice
 
-        # gt_boxes = torch.FloatTensor([1,1,1,1,1])
-        gt_boxes = torch.from_numpy(blobs['gt_boxes'])
-        choice = self.cat_list[index]
 
-        return data, query, im_info, gt_boxes, choice
-
-  def load_query(self, choice, id=0):
+  def load_support(self, choice, id=0):
     
     if self.training:
-        # Random choice query catgory image
-        all_data = self._query[choice]
+        # Random choice support catgory image
+        all_data = self._support[choice]
         data     = random.choice(all_data)
     else:
         # Take out the purpose category for testing
         catgory = self.cat_list[choice]
         # list all the candidate image 
-        all_data = self._query[catgory]
+        all_data = self._support[catgory]
 
         # Use image_id to determine the random seed
         # The list l is candidate sequence, which random by image_id
@@ -296,7 +243,7 @@ class roibatchLoader(data.Dataset):
         random.shuffle(l)
 
         # choose the candidate sequence and take out the data information
-        position=l[self.query_position%len(l)]
+        position=l[self.support_position%len(l)]
         data     = all_data[position]
 
     # Get image
@@ -308,7 +255,7 @@ class roibatchLoader(data.Dataset):
       im = im[:,:,np.newaxis]
       im = np.concatenate((im,im,im), axis=2)
 
-    im = crop(im, data['boxes'], cfg.TRAIN.query_size)
+    im = crop(im, data['boxes'], cfg.TRAIN.support_size)
     # flip the channel, since the original one using cv2
     # rgb -> bgr
     # im = im[:,:,::-1]
@@ -316,12 +263,12 @@ class roibatchLoader(data.Dataset):
       im = im[:, ::-1, :]
 
 
-    im, im_scale = prep_im_for_blob(im, cfg.PIXEL_MEANS, cfg.TRAIN.query_size,
+    im, im_scale = prep_im_for_blob(im, cfg.PIXEL_MEANS, cfg.TRAIN.support_size,
                     cfg.TRAIN.MAX_SIZE)
     
-    query = im_list_to_blob([im])
+    support = im_list_to_blob([im])
 
-    return query
+    return support
 
   def __len__(self):
     return len(self.ratio_index)
