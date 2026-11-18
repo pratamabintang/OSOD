@@ -11,7 +11,6 @@ from PIL import Image
 import torch
 from collections import Counter
 
-from scipy.misc import imread
 from model.utils.config import cfg
 from roi_data_layer.minibatch import get_minibatch, get_minibatch
 from model.utils.blob import prep_im_for_blob, im_list_to_blob, crop
@@ -248,7 +247,7 @@ class roibatchLoader(data.Dataset):
 
     # Get image
     path       = data['image_path']
-    im = imread(path)
+    im = np.array(Image.open(path).convert('RGB'))
     
 
     if len(im.shape) == 2:
@@ -274,7 +273,10 @@ class roibatchLoader(data.Dataset):
     return len(self.ratio_index)
   
   def filter(self, seen):
-    if seen==1:
+    if self._num_classes == 2:
+      # single-class dataset (broiler): class index 1 maps to cat_id 1 in _classes
+      self.list = [self._classes[1]]
+    elif seen==1:
       self.list = cfg.train_categories
       # Group number to class
       if len(self.list)==1:

@@ -52,13 +52,6 @@ def get_extensions():
     include_dirs = [extensions_dir]
 
     ext_modules = [
-        extension(
-            "model._C",
-            sources,
-            include_dirs=include_dirs,
-            define_macros=define_macros,
-            extra_compile_args=extra_compile_args,
-        ),
         Extension(
         'pycocotools._mask',
         sources=['pycocotools/maskApi.c', 'pycocotools/_mask.pyx'],
