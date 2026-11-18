@@ -25,6 +25,8 @@ from model.utils.net_utils import weights_normal_init, \
 
 from model.faster_rcnn.vgg16 import vgg16
 from model.faster_rcnn.resnet import resnet
+from model.roi_layers import nms
+from model.rpn.bbox_transform import bbox_transform_inv, clip_boxes
 
 def parse_args():
   """
@@ -49,6 +51,9 @@ def parse_args():
   parser.add_argument('--checkpoint_interval', dest='checkpoint_interval',
                       help='number of iterations to display',
                       default=10000, type=int)
+  parser.add_argument('--val_interval', dest='val_interval',
+                      help='evaluate on val every N epochs, save best checkpoint (0 = off)',
+                      default=1, type=int)
 
   parser.add_argument('--save_dir', dest='save_dir',
                       help='directory to save models', default="models",
@@ -143,6 +148,44 @@ class sampler(Sampler):
   def __len__(self):
     return self.num_data
 
+def evaluate_val(fasterRCNN, dataset, imdb, ratio_index, class_agnostic):
+  fasterRCNN.eval()
+  dataset.support_position = 0
+  dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+  data_iter = iter(dataloader)
+  all_boxes = [[[] for _ in range(len(imdb.image_index))] for _ in range(imdb.num_classes)]
+
+  with torch.no_grad():
+    for index in ratio_index[0]:
+      im_data, support, im_info, gt_boxes, catgory = [d.cuda() for d in next(data_iter)]
+      rois, cls_prob, bbox_pred = fasterRCNN(im_data, support, im_info, gt_boxes, catgory)[:3]
+
+      scores = cls_prob.data.squeeze()
+      boxes = rois.data[:, :, 1:5]
+      box_deltas = bbox_pred.data.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda() \
+                 + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda()
+      if class_agnostic:
+        box_deltas = box_deltas.view(1, -1, 4)
+      else:
+        box_deltas = box_deltas.view(1, -1, 4 * len(imdb.classes))
+      pred_boxes = bbox_transform_inv(boxes, box_deltas, 1)
+      pred_boxes = clip_boxes(pred_boxes, im_info.data, 1)
+      pred_boxes = (pred_boxes / im_info.data[0][2].item()).squeeze()
+
+      inds = torch.nonzero(scores > 0).view(-1)
+      if inds.numel() > 0:
+        cls_scores = scores[inds]
+        cls_boxes = pred_boxes[inds, :]
+        cls_dets = torch.cat((cls_boxes, cls_scores.unsqueeze(1)), 1)
+        _, order = torch.sort(cls_scores, 0, True)
+        cls_dets = cls_dets[order]
+        keep = nms(cls_boxes[order, :], cls_scores[order], cfg.TEST.NMS)
+        cls_dets = cls_dets[keep.view(-1).long()][:100]
+        all_boxes[int(catgory.item())][index] = cls_dets.cpu().numpy()
+
+  aps = imdb.evaluate_detections(all_boxes, None)
+  return float(np.mean(aps))
+
 if __name__ == '__main__':
 
   args = parse_args()
@@ -197,6 +240,11 @@ if __name__ == '__main__':
   dataset = roibatchLoader(roidb, ratio_list, ratio_index, support, args.batch_size, imdb.num_classes, training=True)
   dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size,
                             sampler=sampler_batch, num_workers=args.num_workers)
+
+  if args.val_interval > 0:
+    imdb_val, roidb_val, ratio_list_val, ratio_index_val, support_val = combined_roidb(args.imdbval_name, False, seen=args.seen)
+    imdb_val.competition_mode(on=True)
+    dataset_val = roibatchLoader(roidb_val, ratio_list_val, ratio_index_val, support_val, 1, imdb_val.num_classes, training=False, seen=args.seen)
 
   # create output directory
   output_dir = args.save_dir + "/" + args.net + "/" + args.dataset
@@ -284,6 +332,7 @@ if __name__ == '__main__':
     from tensorboardX import SummaryWriter
     logger = SummaryWriter("logs")
 
+  best_ap = -1.0
   for epoch in range(args.start_epoch, args.max_epochs + 1):
     # setting to train mode
     fasterRCNN.train()
@@ -363,16 +412,26 @@ if __name__ == '__main__':
         start = time.time()
 
     
-    save_name = os.path.join(output_dir, 'faster_rcnn_{}_{}_{}.pth'.format(args.session, epoch, step))
-    save_checkpoint({
+    state = {
       'session': args.session,
       'epoch': epoch + 1,
       'model': fasterRCNN.module.state_dict() if args.mGPUs else fasterRCNN.state_dict(),
       'optimizer': optimizer.state_dict(),
       'pooling_mode': cfg.POOLING_MODE,
       'class_agnostic': args.class_agnostic,
-    }, save_name)
+    }
+    save_name = os.path.join(output_dir, 'faster_rcnn_{}_{}_{}.pth'.format(args.session, epoch, step))
+    save_checkpoint(state, save_name)
     print('save model: {}'.format(save_name))
+
+    if args.val_interval > 0 and epoch % args.val_interval == 0:
+      ap = evaluate_val(fasterRCNN, dataset_val, imdb_val, ratio_index_val, args.class_agnostic)
+      print('[epoch %2d] val mAP = %.4f, best = %.4f' % (epoch, ap, max(best_ap, ap)))
+      if ap > best_ap:
+        best_ap = ap
+        best_name = os.path.join(output_dir, 'best_faster_rcnn_{}_{}_{}.pth'.format(args.session, epoch, step))
+        save_checkpoint(state, best_name)
+        print('save best model: {}'.format(best_name))
 
   if args.use_tfboard:
     logger.close()
